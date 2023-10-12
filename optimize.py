@@ -135,38 +135,53 @@ class Mesh:
         line_len = torch.squeeze(torch.linalg.vecdot(v2 - v1, line_dir))
         line_normal = torch.stack([line_dir[1], -line_dir[0]], dim=-1)
 
+        # line_dir and line_normal form an orthonormal basis aligned with the line.
+        # We're going to transform all the triangle points into this space.
+
         to_points = self.triangles[:, :, 0:2] - v1.expand(self.triangles[:, :, 0:2].size())
 
         tangent_dists = torch.linalg.vecdot(to_points, line_dir.expand(to_points.size()))
         tangent_min = torch.min(tangent_dists, dim=1)[0]
         tangent_max = torch.max(tangent_dists, dim=1)[0]
-        min_tangent_costs = torch.pow(tangent_min - torch.min(torch.stack([torch.zeros_like(line_len), line_len])).expand(tangent_min.size()), 2)
-        max_tangent_costs = torch.pow(tangent_max - torch.max(torch.stack([torch.zeros_like(line_len), line_len])).expand(tangent_max.size()), 2)
 
         normal_dists = torch.linalg.vecdot(to_points, line_normal.expand(to_points.size()))
         min_normal = torch.min(normal_dists, dim=1)[0]
         max_normal = torch.max(normal_dists, dim=1)[0]
+
+        # If a triangle is perfectly aligned, all vertices are a distance of 0 away in
+        # the normal axis. Any deviation from this contributes to misalignment, so
+        # we can add it to the total cost.
         min_normal_cost = torch.pow(min_normal, 2)
         max_normal_cost = torch.pow(max_normal, 2)
-
-        # alignment_cost = max_normal - min_normal
         normal_cost = min_normal_cost + max_normal_cost
+
+        # The line itself has one endpoint at 0 and one at `line_len` along the tangent
+        # axis. Any deviation from these contributes to triangles "sliding," so we can add
+        # it to the total cost.
+        min_tangent_costs = torch.pow(tangent_min, 2)
+        max_tangent_costs = torch.pow(tangent_max - line_len.expand(tangent_max.size()), 2)
         tangent_cost = min_tangent_costs + max_tangent_costs
 
-        # sum_dist = torch.pow(normal_cost * 0.1, 2) + torch.pow(tangent_cost, 2)
-        # dist_weight = torch.pow(sum_dist * 0.01, -1)
+        # Get the minimum squared distance from the triangle to the line (x^2 + y^2, in
+        # tangent-normal space)
+        min_dist_sq = torch.min(torch.stack([torch.pow(tangent_min, 2), torch.pow(tangent_max - line_len.expand(tangent_max.size()), 2)]), dim=0)[0]
+        min_dist_sq += torch.min(torch.stack([torch.pow(min_normal, 2), torch.pow(max_normal, 2)]), dim=0)[0]
 
-        min_dist = pow(torch.min(torch.stack([torch.abs(tangent_min), torch.abs(tangent_max)]), dim=0)[0], 2)
-        min_dist += pow(torch.min(torch.stack([torch.abs(min_normal), torch.abs(max_normal)]), dim=0)[0], 2)
-
+        # We want the opacity (alpha) to be 1 when something it's on a line, and 0 if it's not. However,
+        # we only care if it matches if it's actually close to the line. `alpha_dist_threshold` is the
+        # minimum distance threshold we use.
         alpha_dist_threshold = 1
-        target_alpha = -torch.special.expit((min_dist - alpha_dist_threshold**2) * 100) + 1
-        dist_cost = torch.special.expit((normal_cost + tangent_cost) * target_alpha * 10) * 100
-        print(dist_cost)
-        alpha_cost = torch.pow(alpha - target_alpha, 2) * dist_cost
+        # `target_alpha` should be 1 when the min distance is 0, and it should be 1 when the min
+        # distance is >= `alpha_dist_threshold`
+        target_alpha = -torch.special.expit((min_dist_sq - alpha_dist_threshold**2) * 100) + 1
+        dist_cost = torch.special.expit((normal_cost + tangent_cost) * 1)
+        alpha_cost = torch.pow(alpha - target_alpha, 2) * 0.1 + dist_cost * 10
 
-        dist_weight_threshold = 0.5
-        dist_weight = -torch.special.expit((min_dist - dist_weight_threshold**2) * 100) + 1
+        # We don't care about triangles that are very far away from the line, so we'll multiply
+        # the weight for this triangle by this distance weight so that triangles whose min
+        # distance is >= `dist_weight_threshold` don't have any cost added to it from this line.
+        dist_weight_threshold = 2
+        dist_weight = torch.special.expit((dist_weight_threshold**2 - min_dist_sq) * 1000)
         return (alpha_cost, dist_weight, target_alpha)
 
     def loss(self, target):
@@ -177,6 +192,8 @@ class Mesh:
         for i in range(target.size(dim=0)):
             alpha_cost, dist_weight, target_alpha = self.line_cost(alpha, i)
             loss += torch.sum(alpha_cost * dist_weight)
+
+        # TODO regularize to prioritize zeroed blend weights
 
         return loss
 
@@ -200,11 +217,11 @@ for t in range(100):
     # Take a gradient descent step.
     optimizer.step()
     with torch.no_grad():
-        # suzanne.constrain()
+        # Force all weights to be between 0 and 1
+        suzanne.constrain()
         suzanne.update_triangles()
+
     print(suzanne.blend_weights)
     suzanne.render(target, iter=t)
 
 suzanne.output('blended.obj')
-
-# img = empty_image(256, 256)
